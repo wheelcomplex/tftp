@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"io"
 	"time"
-	"log"
 )
 
 type receiver struct {
+	conf config
 	remoteAddr *net.UDPAddr
 	conn *net.UDPConn
 	writer *io.PipeWriter
 	filename string
 	mode string
-	log *log.Logger
 }
 
 func (r *receiver) Run(isServerMode bool) (error) {
@@ -26,9 +25,7 @@ func (r *receiver) Run(isServerMode bool) (error) {
 	for {
 		last, e := r.receiveBlock(buffer, blockNumber, firstBlock && !isServerMode)
 		if e != nil {
-			if r.log != nil {
-				r.log.Printf("Error receiving block %d: %v", blockNumber, e)
-			}
+			r.conf.Log().Printf("Error receiving block %d: %v", blockNumber, e)
 			r.writer.CloseWithError(e)
 			return e
 		}
@@ -44,17 +41,17 @@ func (r *receiver) Run(isServerMode bool) (error) {
 }
 
 func (r *receiver) receiveBlock(b []byte, n uint16, firstBlockOnClient bool) (last bool, e error) {
-	for i := 0; i < 3; i++ {
+	for i := 0; i < r.conf.RetryCount(); i++ {
 		if firstBlockOnClient {
 			rrqPacket := RRQ{r.filename, r.mode}
 			r.conn.WriteToUDP(rrqPacket.Pack(), r.remoteAddr)
-			r.log.Printf("sent RRQ (filename=%s, mode=%s)", r.filename, r.mode)
+			r.conf.Log().Printf("sent RRQ (filename=%s, mode=%s)", r.filename, r.mode)
 		} else {
 			ackPacket := ACK{n - 1}
 			r.conn.WriteToUDP(ackPacket.Pack(), r.remoteAddr)
-			r.log.Printf("sent ACK #%d", n - 1)
+			r.conf.Log().Printf("sent ACK #%d", n - 1)
 		}
-		setDeadlineError := r.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		setDeadlineError := r.conn.SetReadDeadline(time.Now().Add(time.Duration(r.conf.Timeout()) * time.Second))
 		if setDeadlineError != nil {
 			return false, fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
 		}
@@ -71,7 +68,7 @@ func (r *receiver) receiveBlock(b []byte, n uint16, firstBlockOnClient bool) (la
 			}
 			switch p := Packet(*packet).(type) {
 				case *DATA:
-					r.log.Printf("got DATA #%d (%d bytes)", p.BlockNumber, len(p.Data));
+					r.conf.Log().Printf("got DATA #%d (%d bytes)", p.BlockNumber, len(p.Data));
 					if n == p.BlockNumber {
 						if firstBlockOnClient {
 							r.remoteAddr = remoteAddr
@@ -94,14 +91,14 @@ func (r *receiver) receiveBlock(b []byte, n uint16, firstBlockOnClient bool) (la
 }
 
 func (r *receiver) terminate(b []byte, n uint16, dallying bool) (e error) {
-	for i := 0; i < 3; i++ {
+	for i := 0; i < r.conf.RetryCount(); i++ {
 		ackPacket := ACK{n}
 		_, e := r.conn.WriteToUDP(ackPacket.Pack(), r.remoteAddr)
-		r.log.Printf("sent ACK #%d", n)
+		r.conf.Log().Printf("sent ACK #%d", n)
 		if !dallying {
 			return e
 		}
-		setDeadlineError := r.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		setDeadlineError := r.conn.SetReadDeadline(time.Now().Add(time.Duration(r.conf.Timeout()) * time.Second))
 		if setDeadlineError != nil {
 			return fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
 		}
@@ -119,7 +116,7 @@ func (r *receiver) terminate(b []byte, n uint16, dallying bool) (e error) {
 			}
 			switch p := Packet(*packet).(type) {
 				case *DATA:
-					r.log.Printf("got DATA #%d (%d bytes)", p.BlockNumber, len(p.Data));
+					r.conf.Log().Printf("got DATA #%d (%d bytes)", p.BlockNumber, len(p.Data));
 					if n == p.BlockNumber {
 						break l1
 					}

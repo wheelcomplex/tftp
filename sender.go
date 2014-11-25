@@ -5,16 +5,15 @@ import (
 	"io"
 	"fmt"
 	"time"
-	"log"
 )
 
 type sender struct {
+	conf config
 	remoteAddr *net.UDPAddr
 	conn *net.UDPConn
 	reader *io.PipeReader
 	filename string
 	mode string
-	log *log.Logger
 }
 
 func (s *sender) Run(isServerMode bool) {
@@ -24,7 +23,7 @@ func (s *sender) Run(isServerMode bool) {
 	if !isServerMode {
 		e := s.sendRequest(tmp)
 		if e != nil {
-			s.log.Printf("Error starting transmission: %v", e)
+			s.conf.Log().Printf("Error starting transmission: %v", e)
 			s.reader.CloseWithError(e)
 			return
 		}
@@ -42,17 +41,15 @@ func (s *sender) Run(isServerMode bool) {
 				}
 				if lastBlockSize == BLOCK_SIZE || lastBlockSize == -1 {
 					sendError := s.sendBlock(buffer, 0, blockNumber, tmp)
-					if sendError != nil && s.log != nil {
-						s.log.Printf("Error sending last block: %v", sendError)
+					if sendError != nil {
+						s.conf.Log().Printf("Error sending last block: %v", sendError)
 					}
 				}
 			} else {
-				if s.log != nil {
-					s.log.Printf("Handler error: %v", readError)
-				}
+				s.conf.Log().Printf("Handler error: %v", readError)
 				errorPacket := ERROR{1, readError.Error()}
 				s.conn.WriteToUDP(errorPacket.Pack(), s.remoteAddr)
-				s.log.Printf("sent ERROR (code=%d): %s", 1, readError.Error())
+				s.conf.Log().Printf("sent ERROR (code=%d): %s", 1, readError.Error())
 			}
 			return
 		}
@@ -61,9 +58,7 @@ func (s *sender) Run(isServerMode bool) {
 		}
 		sendError := s.sendBlock(buffer, c, blockNumber, tmp)
 		if sendError != nil {
-			if s.log != nil {
-				s.log.Printf("Error sending block %d: %v", blockNumber, sendError)
-			}
+			s.conf.Log().Printf("Error sending block %d: %v", blockNumber, sendError)
 			s.reader.CloseWithError(sendError)
 			return
 		}
@@ -73,11 +68,11 @@ func (s *sender) Run(isServerMode bool) {
 }
 
 func (s *sender) sendRequest(tmp []byte) (e error) {
-	for i := 0; i < 3; i++ {
+	for i := 0; i < s.conf.RetryCount(); i++ {
 		wrqPacket := WRQ{s.filename, s.mode}
 		s.conn.WriteToUDP(wrqPacket.Pack(), s.remoteAddr)
-		s.log.Printf("sent WRQ (filename=%s, mode=%s)", s.filename, s.mode)
-		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		s.conf.Log().Printf("sent WRQ (filename=%s, mode=%s)", s.filename, s.mode)
+		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.conf.Timeout()) * time.Second))
 		if setDeadlineError != nil {
 			return fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
 		}
@@ -95,7 +90,7 @@ func (s *sender) sendRequest(tmp []byte) (e error) {
 			switch p := Packet(*packet).(type) {
 				case *ACK:
 					if p.BlockNumber == 0 {
-						s.log.Printf("got ACK #0");
+						s.conf.Log().Printf("got ACK #0");
 						s.remoteAddr = remoteAddr
 						return nil
 					}
@@ -108,14 +103,14 @@ func (s *sender) sendRequest(tmp []byte) (e error) {
 }
 
 func (s *sender) sendBlock(b []byte, c int, n uint16, tmp []byte) (e error) {
-	for i := 0; i < 3; i++ {
-		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for i := 0; i < s.conf.RetryCount(); i++ {
+		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(time.Duration(s.conf.Timeout()) * time.Second))
 		if setDeadlineError != nil {
 			return fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
 		}
 		dataPacket := DATA{n, b[:c]}
 		s.conn.WriteToUDP(dataPacket.Pack(), s.remoteAddr)
-		s.log.Printf("sent DATA #%d (%d bytes)", n, c)
+		s.conf.Log().Printf("sent DATA #%d (%d bytes)", n, c)
 		for {
 			c, _, readError := s.conn.ReadFromUDP(tmp)
 			if networkError, ok := readError.(net.Error); ok && networkError.Timeout() {
@@ -129,7 +124,7 @@ func (s *sender) sendBlock(b []byte, c int, n uint16, tmp []byte) (e error) {
 			}
 			switch p := Packet(*packet).(type) {
 				case *ACK:
-					s.log.Printf("got ACK #%d", p.BlockNumber)
+					s.conf.Log().Printf("got ACK #%d", p.BlockNumber)
 					if n == p.BlockNumber {
 						return nil
 					}
