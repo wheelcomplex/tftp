@@ -6,6 +6,7 @@ import (
 	"log"
 	"fmt"
 	"sync"
+	"io/ioutil"
 )
 
 /*
@@ -60,9 +61,41 @@ Downloading file from server example
 	})
 */
 type Client struct {
-	RemoteAddr *net.UDPAddr
-	Log *log.Logger
+	remoteAddr *net.UDPAddr
+	log *log.Logger
+	retryCount int
+	timeout int
 }
+
+func NewClient(remoteAddr *net.UDPAddr) (Client) {
+	log := log.New(ioutil.Discard, "", 0)
+	return Client{remoteAddr, log, DEFAULT_RETRY_COUNT, DEFAULT_TIMEOUT}
+}
+
+func (c Client) SetLogger(logger *log.Logger) {
+	c.log = logger
+}
+
+func (c Client) Log() (*log.Logger) {
+	return c.log
+}
+
+func (c Client) SetRetryCount(n int) {
+	c.retryCount = n
+}
+
+func (c Client) RetryCount() (n int) {
+	return c.retryCount
+}
+
+func (c Client) SetTimeout(seconds int) {
+	c.timeout = seconds
+}
+
+func (c Client) Timeout() (seconds int) {
+	return c.timeout
+}
+
 
 // Method for uploading file to server
 func (c Client) Put(filename string, mode string, handler func(w *io.PipeWriter)) (error) {
@@ -75,7 +108,7 @@ func (c Client) Put(filename string, mode string, handler func(w *io.PipeWriter)
 		return e
 	}
 	reader, writer := io.Pipe()
-	s := &sender{c.RemoteAddr, conn, reader, filename, mode, c.Log}
+	s := &sender{c, c.remoteAddr, conn, reader, filename, mode}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -98,7 +131,7 @@ func (c Client) Get(filename string, mode string, handler func(r *io.PipeReader)
 		return e
 	}
 	reader, writer := io.Pipe()
-	r := &receiver{c.RemoteAddr, conn, writer, filename, mode, c.Log}
+	r := &receiver{c, c.remoteAddr, conn, writer, filename, mode}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {

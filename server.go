@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"io/ioutil"
 )
 
 /*
@@ -50,14 +51,45 @@ for read and write requests and optional logger.
 	}
 */
 type Server struct {
-	BindAddr *net.UDPAddr
-	ReadHandler func(filename string, r *io.PipeReader)
-	WriteHandler func(filename string, w *io.PipeWriter)
-	Log *log.Logger
+	bindAddr *net.UDPAddr
+	readHandler func(filename string, r *io.PipeReader)
+	writeHandler func(filename string, w *io.PipeWriter)
+	log *log.Logger
+	retryCount int
+	timeout int
+}
+
+func NewServer(bindAddr *net.UDPAddr, readHandler func(filename string, r *io.PipeReader), writeHandler func(filename string, w *io.PipeWriter)) (Server){
+	log := log.New(ioutil.Discard, "", 0)
+	return Server{bindAddr, readHandler, writeHandler, log, DEFAULT_RETRY_COUNT, DEFAULT_TIMEOUT}
+}
+
+func (s Server) SetLogger(logger *log.Logger) {
+	s.log = logger
+}
+
+func (s Server) Log() (*log.Logger) {
+	return s.log
+}
+
+func (s Server) SetRetryCount(n int) {
+	s.retryCount = n
+}
+
+func (s Server) RetryCount() (n int) {
+	return s.retryCount
+}
+
+func (s Server) SetTimeout(seconds int) {
+	s.timeout = seconds
+}
+
+func (s Server) Timeout() (seconds int) {
+	return s.timeout
 }
 
 func (s Server) Serve() (error) {
-	conn, e := net.ListenUDP("udp", s.BindAddr)
+	conn, e := net.ListenUDP("udp", s.bindAddr)
 	if e != nil {
 		return e
 	}
@@ -65,7 +97,7 @@ func (s Server) Serve() (error) {
 		e = s.processRequest(conn)
 		if e != nil {
 			if s.Log != nil {
-				s.Log.Printf("%v\n", e);
+				s.Log().Printf("%v\n", e);
 			}
 		}
 	}
@@ -84,14 +116,14 @@ func (s Server) processRequest(conn *net.UDPConn) (error) {
 	}
 	switch p := Packet(*p).(type) {
 		case *WRQ:
-			s.Log.Printf("got WRQ (filename=%s, mode=%s)", p.Filename, p.Mode)
+			s.Log().Printf("got WRQ (filename=%s, mode=%s)", p.Filename, p.Mode)
 			trasnmissionConn, e := s.transmissionConn()
 			if e != nil {
 				return fmt.Errorf("Could not start transmission: %v", e)
 			}
 			reader, writer := io.Pipe()
-			r := &receiver{remoteAddr, trasnmissionConn, writer, p.Filename, p.Mode, s.Log}
-			go s.ReadHandler(p.Filename, reader)
+			r := &receiver{s, remoteAddr, trasnmissionConn, writer, p.Filename, p.Mode}
+			go s.readHandler(p.Filename, reader)
 			// Writing zero bytes to the pipe just to check for any handler errors early
 			var null_buffer []byte
 			null_buffer = make([]byte, 0)
@@ -99,19 +131,19 @@ func (s Server) processRequest(conn *net.UDPConn) (error) {
 			if e != nil {
 				errorPacket := ERROR{1, e.Error()}
 				trasnmissionConn.WriteToUDP(errorPacket.Pack(), remoteAddr)
-				s.Log.Printf("sent ERROR (code=%d): %s", 1, e.Error())
+				s.Log().Printf("sent ERROR (code=%d): %s", 1, e.Error())
 				return e
 			}
 			go r.Run(true)
 		case *RRQ:
-			s.Log.Printf("got RRQ (filename=%s, mode=%s)", p.Filename, p.Mode)
+			s.Log().Printf("got RRQ (filename=%s, mode=%s)", p.Filename, p.Mode)
 			trasnmissionConn, e := s.transmissionConn()
 			if e != nil {
 				return fmt.Errorf("Could not start transmission: %v", e)
 			}
 			reader, writer := io.Pipe()
-			r := &sender{remoteAddr, trasnmissionConn, reader, p.Filename, p.Mode, s.Log}
-			go s.WriteHandler(p.Filename, writer)
+			r := &sender{s, remoteAddr, trasnmissionConn, reader, p.Filename, p.Mode}
+			go s.writeHandler(p.Filename, writer)
 			go r.Run(true)
 	}
 	return nil
