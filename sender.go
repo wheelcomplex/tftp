@@ -1,142 +1,245 @@
 package tftp
 
 import (
-	"net"
-	"io"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"net"
+	"strconv"
 	"time"
-	"log"
+
+	"github.com/pin/tftp/netascii"
 )
 
+// OutgoingTransfer provides methods to set the outgoing transfer size and
+// retrieve the remote address of the peer.
+type OutgoingTransfer interface {
+	// SetSize is used to set the outgoing transfer size (tsize option: RFC2349)
+	// manually in a server write transfer handler.
+	//
+	// It is not necessary in most cases; when the io.Reader provided to
+	// ReadFrom also satisfies io.Seeker (e.g. os.File) the transfer size will
+	// be determined automatically. Seek will not be attempted when the
+	// transfer size option is set with SetSize.
+	//
+	// The value provided will be used only if SetSize is called before ReadFrom
+	// and only on in a server read handler.
+	SetSize(n int64)
+
+	// RemoteAddr returns the remote peer's IP address and port.
+	RemoteAddr() net.UDPAddr
+}
+
 type sender struct {
-	remoteAddr *net.UDPAddr
-	conn *net.UDPConn
-	reader *io.PipeReader
-	filename string
-	mode string
-	log *log.Logger
+	conn    *net.UDPConn
+	addr    *net.UDPAddr
+	localIP net.IP
+	tid     int
+	send    []byte
+	receive []byte
+	retry   *backoff
+	timeout time.Duration
+	retries int
+	block   uint16
+	mode    string
+	opts    options
 }
 
-func (s *sender) Run(isServerMode bool) {
-	var buffer, tmp []byte
-	buffer = make([]byte, BLOCK_SIZE)
-	tmp = make([]byte, MAX_DATAGRAM_SIZE)
-	if !isServerMode {
-		e := s.sendRequest(tmp)
-		if e != nil {
-			s.log.Printf("Error starting transmission: %v", e)
-			s.reader.CloseWithError(e)
-			return
+func (s *sender) RemoteAddr() net.UDPAddr { return *s.addr }
+func (s *sender) LocalIP() net.IP         { return s.localIP }
+
+func (s *sender) SetSize(n int64) {
+	if s.opts != nil {
+		if _, ok := s.opts["tsize"]; ok {
+			s.opts["tsize"] = strconv.FormatInt(n, 10)
 		}
 	}
-	var blockNumber uint16
-	blockNumber = 1
-	lastBlockSize := -1
+}
+
+func (s *sender) ReadFrom(r io.Reader) (n int64, err error) {
+	if s.mode == "netascii" {
+		r = netascii.ToReader(r)
+	}
+	if s.opts != nil {
+		// check that tsize is set
+		if ts, ok := s.opts["tsize"]; ok {
+			// check that tsize is not set with SetSize already
+			i, err := strconv.ParseInt(ts, 10, 64)
+			if err == nil && i == 0 {
+				if rs, ok := r.(io.Seeker); ok {
+					pos, err := rs.Seek(0, 1)
+					if err != nil {
+						return 0, err
+					}
+					size, err := rs.Seek(0, 2)
+					if err != nil {
+						return 0, err
+					}
+					s.opts["tsize"] = strconv.FormatInt(size, 10)
+					_, err = rs.Seek(pos, 0)
+					if err != nil {
+						return 0, err
+					}
+				}
+			}
+		}
+		err = s.sendOptions()
+		if err != nil {
+			s.abort(err)
+			return 0, err
+		}
+	}
+	s.block = 1 // start data transmission with block 1
+	binary.BigEndian.PutUint16(s.send[0:2], opDATA)
 	for {
-		c, readError := s.reader.Read(buffer)
-		if readError != nil {
-			if readError == io.EOF { // && c == 0 ?
-				// we could have c != 0 here
-				if c != 0 {
-					panic("error!")
+		l, err := io.ReadFull(r, s.send[4:])
+		n += int64(l)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			if err == io.EOF {
+				binary.BigEndian.PutUint16(s.send[2:4], s.block)
+				_, err = s.sendWithRetry(4)
+				if err != nil {
+					s.abort(err)
+					return n, err
 				}
-				if lastBlockSize == BLOCK_SIZE || lastBlockSize == -1 {
-					sendError := s.sendBlock(buffer, 0, blockNumber, tmp)
-					if sendError != nil && s.log != nil {
-						s.log.Printf("Error sending last block: %v", sendError)
-					}
-				}
+				s.conn.Close()
+				return n, nil
+			}
+			s.abort(err)
+			return n, err
+		}
+		binary.BigEndian.PutUint16(s.send[2:4], s.block)
+		_, err = s.sendWithRetry(4 + l)
+		if err != nil {
+			s.abort(err)
+			return n, err
+		}
+		if l < len(s.send)-4 {
+			s.conn.Close()
+			return n, nil
+		}
+		s.block++
+	}
+}
+
+func (s *sender) sendOptions() error {
+	for name, value := range s.opts {
+		if name == "blksize" {
+			err := s.setBlockSize(value)
+			if err != nil {
+				delete(s.opts, name)
+				continue
+			}
+		} else if name == "tsize" {
+			if value != "0" {
+				s.opts["tsize"] = value
 			} else {
-				if s.log != nil {
-					s.log.Printf("Handler error: %v", readError)
+				delete(s.opts, name)
+				continue
+			}
+		} else {
+			delete(s.opts, name)
+		}
+	}
+	if len(s.opts) > 0 {
+		m := packOACK(s.send, s.opts)
+		_, err := s.sendWithRetry(m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *sender) setBlockSize(blksize string) error {
+	n, err := strconv.Atoi(blksize)
+	if err != nil {
+		return err
+	}
+	if n < 512 {
+		return fmt.Errorf("blkzise too small: %d", n)
+	}
+	if n > 65464 {
+		return fmt.Errorf("blksize too large: %d", n)
+	}
+	s.send = make([]byte, n+4)
+	return nil
+}
+
+func (s *sender) sendWithRetry(l int) (*net.UDPAddr, error) {
+	s.retry.reset()
+	for {
+		addr, err := s.sendDatagram(l)
+		if _, ok := err.(net.Error); ok && s.retry.count() < s.retries {
+			s.retry.backoff()
+			continue
+		}
+		return addr, err
+	}
+}
+
+func (s *sender) sendDatagram(l int) (*net.UDPAddr, error) {
+	err := s.conn.SetReadDeadline(time.Now().Add(s.timeout))
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.conn.WriteToUDP(s.send[:l], s.addr)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		n, addr, err := s.conn.ReadFromUDP(s.receive)
+		if err != nil {
+			return nil, err
+		}
+		if !addr.IP.Equal(s.addr.IP) || (s.tid != 0 && addr.Port != s.tid) {
+			continue
+		}
+		p, err := parsePacket(s.receive[:n])
+		if err != nil {
+			continue
+		}
+		s.tid = addr.Port
+		switch p := p.(type) {
+		case pACK:
+			if p.block() == s.block {
+				return addr, nil
+			}
+		case pOACK:
+			opts, err := unpackOACK(p)
+			if s.block != 0 {
+				continue
+			}
+			if err != nil {
+				s.abort(err)
+				return addr, err
+			}
+			for name, value := range opts {
+				if name == "blksize" {
+					err := s.setBlockSize(value)
+					if err != nil {
+						continue
+					}
 				}
-				errorPacket := ERROR{1, readError.Error()}
-				s.conn.WriteToUDP(errorPacket.Pack(), s.remoteAddr)
-				s.log.Printf("sent ERROR (code=%d): %s", 1, readError.Error())
 			}
-			return
+			return addr, nil
+		case pERROR:
+			return nil, fmt.Errorf("sending block %d: code=%d, error: %s",
+				s.block, p.code(), p.message())
 		}
-		if c == 0 {
-			continue;
-		}
-		sendError := s.sendBlock(buffer, c, blockNumber, tmp)
-		if sendError != nil {
-			if s.log != nil {
-				s.log.Printf("Error sending block %d: %v", blockNumber, sendError)
-			}
-			s.reader.CloseWithError(sendError)
-			return
-		}
-		blockNumber++
-		lastBlockSize = c
 	}
 }
 
-func (s *sender) sendRequest(tmp []byte) (e error) {
-	for i := 0; i < 3; i++ {
-		wrqPacket := WRQ{s.filename, s.mode}
-		s.conn.WriteToUDP(wrqPacket.Pack(), s.remoteAddr)
-		s.log.Printf("sent WRQ (filename=%s, mode=%s)", s.filename, s.mode)
-		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		if setDeadlineError != nil {
-			return fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
-		}
-		for {
-			c, remoteAddr, readError := s.conn.ReadFromUDP(tmp)
-			if networkError, ok := readError.(net.Error); ok && networkError.Timeout() {
-				break
-			} else if readError != nil {
-				return fmt.Errorf("Error reading UDP packet: %v", readError)
-			}
-			packet, e := ParsePacket(tmp[:c])
-			if e != nil {
-				continue
-			}
-			switch p := Packet(*packet).(type) {
-				case *ACK:
-					if p.BlockNumber == 0 {
-						s.log.Printf("got ACK #0");
-						s.remoteAddr = remoteAddr
-						return nil
-					}
-				case *ERROR:
-					return fmt.Errorf("Transmission error %d: %s", p.ErrorCode, p.ErrorMessage)
-			}
-		}	
+func (s *sender) abort(err error) error {
+	if s.conn == nil {
+		return nil
 	}
-	return fmt.Errorf("Send timeout")
-}
-
-func (s *sender) sendBlock(b []byte, c int, n uint16, tmp []byte) (e error) {
-	for i := 0; i < 3; i++ {
-		setDeadlineError := s.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		if setDeadlineError != nil {
-			return fmt.Errorf("Could not set UDP timeout: %v", setDeadlineError)
-		}
-		dataPacket := DATA{n, b[:c]}
-		s.conn.WriteToUDP(dataPacket.Pack(), s.remoteAddr)
-		s.log.Printf("sent DATA #%d (%d bytes)", n, c)
-		for {
-			c, _, readError := s.conn.ReadFromUDP(tmp)
-			if networkError, ok := readError.(net.Error); ok && networkError.Timeout() {
-				break
-			} else if readError != nil {
-				return fmt.Errorf("Error reading UDP packet: %v", readError)
-			}
-			packet, e := ParsePacket(tmp[:c])
-			if e != nil {
-				continue
-			}
-			switch p := Packet(*packet).(type) {
-				case *ACK:
-					s.log.Printf("got ACK #%d", p.BlockNumber)
-					if n == p.BlockNumber {
-						return nil
-					}
-				case *ERROR:
-					return fmt.Errorf("Transmission error %d: %s", p.ErrorCode, p.ErrorMessage)
-			}
-		}	
+	n := packERROR(s.send, 1, err.Error())
+	_, err = s.conn.WriteToUDP(s.send[:n], s.addr)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("Send timeout")
+	s.conn.Close()
+	s.conn = nil
+	return nil
 }
