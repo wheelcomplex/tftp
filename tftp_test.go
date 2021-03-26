@@ -14,9 +14,11 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
+
+	"github.com/stretchr/testify/mock"
 )
 
-var localhost string = determineLocalhost()
+var localhost = determineLocalhost()
 
 func determineLocalhost() string {
 	l, err := net.ListenTCP("tcp", nil)
@@ -109,22 +111,23 @@ func packUnpack(t *testing.T, filename, mode string, opts options) {
 }
 
 func TestZeroLength(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	testSendReceive(t, c, 0)
 }
 
 func Test900(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
-	for i := 600; i < 4000; i += 1 {
-		c.blksize = i
+	for i := 600; i < 4000; i++ {
+		c.SetBlockSize(i)
+		s.SetBlockSize(4600 - i)
 		testSendReceive(t, c, 9000+int64(i))
 	}
 }
 
 func Test1000(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	for i := int64(0); i < 5000; i++ {
 		filename := fmt.Sprintf("length-%d-bytes-%d", i, time.Now().UnixNano())
@@ -144,21 +147,76 @@ func Test1000(t *testing.T) {
 }
 
 func Test1810(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
-	c.blksize = 1810
+	c.SetBlockSize(1810)
 	testSendReceive(t, c, 9000+1810)
 }
 
+type fakeHook struct {
+	mock.Mock
+}
+
+func (f *fakeHook) OnSuccess(result TransferStats) {
+	f.Called(result)
+	return
+}
+func (f *fakeHook) OnFailure(result TransferStats, err error) {
+	f.Called(result)
+	return
+}
+
+func TestHookSuccess(t *testing.T) {
+	s, c := makeTestServer(false)
+	fakeHookTemp := new(fakeHook)
+	// Due to the way test are run there will always be some failures
+	fakeHookTemp.On("OnFailure", mock.AnythingOfType("TransferStats")).Return()
+	fakeHookTemp.On("OnSuccess", mock.AnythingOfType("TransferStats")).Return()
+	s.SetHook(fakeHookTemp)
+	c.SetBlockSize(1810)
+	length := int64(9000)
+	filename := fmt.Sprintf("length-%d-bytes-%d", length, time.Now().UnixNano())
+	rf, err := c.Send(filename, "octet")
+	if err != nil {
+		t.Fatalf("requesting %s write: %v", filename, err)
+	}
+	r := io.LimitReader(newRandReader(rand.NewSource(length)), length)
+	n, err := rf.ReadFrom(r)
+	if err != nil {
+		t.Fatalf("sending %s: %v", filename, err)
+	}
+	if n != length {
+		t.Errorf("%s length mismatch: %d != %d", filename, n, length)
+	}
+	s.Shutdown()
+	fakeHookTemp.AssertNumberOfCalls(t, "OnSuccess", 1)
+}
+
+func TestHookFailure(t *testing.T) {
+	s, c := makeTestServer(false)
+	fakeHookTemp := new(fakeHook)
+	fakeHookTemp.On("OnFailure", mock.AnythingOfType("TransferStats")).Return()
+	s.SetHook(fakeHookTemp)
+	filename := "test-not-exists"
+	mode := "octet"
+	_, err := c.Receive(filename, mode)
+	if err == nil {
+		t.Fatalf("file not exists: %v", err)
+	}
+	t.Logf("receiving file that does not exist: %v", err)
+	s.Shutdown()
+	fakeHookTemp.AssertExpectations(t)
+}
+
 func TestTSize(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	c.tsize = true
 	testSendReceive(t, c, 640)
 }
 
 func TestNearBlockLength(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	for i := 450; i < 520; i++ {
 		testSendReceive(t, c, int64(i))
@@ -166,7 +224,7 @@ func TestNearBlockLength(t *testing.T) {
 }
 
 func TestBlockWrapsAround(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	n := 65535 * 512
 	for i := n - 2; i < n+2; i++ {
@@ -175,7 +233,7 @@ func TestBlockWrapsAround(t *testing.T) {
 }
 
 func TestRandomLength(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	r := rand.New(rand.NewSource(42))
 	for i := 0; i < 100; i++ {
@@ -184,13 +242,13 @@ func TestRandomLength(t *testing.T) {
 }
 
 func TestBigFile(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	testSendReceive(t, c, 3*1000*1000)
 }
 
 func TestByOneByte(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	filename := "test-by-one-byte"
 	mode := "octet"
@@ -228,7 +286,7 @@ func TestByOneByte(t *testing.T) {
 }
 
 func TestDuplicate(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	filename := "test-duplicate"
 	mode := "octet"
@@ -250,13 +308,13 @@ func TestDuplicate(t *testing.T) {
 }
 
 func TestNotFound(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	defer s.Shutdown()
 	filename := "test-not-exists"
 	mode := "octet"
 	_, err := c.Receive(filename, mode)
 	if err == nil {
-		t.Fatalf("file not exists", err)
+		t.Fatalf("file not exists: %v", err)
 	}
 	t.Logf("receiving file that does not exist: %v", err)
 }
@@ -360,12 +418,18 @@ type testBackend struct {
 	mu sync.Mutex
 }
 
-func makeTestServer() (*Server, *Client) {
+func makeTestServer(singlePort bool) (*Server, *Client) {
 	b := &testBackend{}
 	b.m = make(map[string][]byte)
 
 	// Create server
 	s := NewServer(b.handleRead, b.handleWrite)
+
+	if singlePort {
+		s.SetBlockSize(2000)
+		s.gcThreshold = 100000
+		s.EnableSinglePort()
+	}
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 	if err != nil {
@@ -479,8 +543,7 @@ func (r *randReader) Read(p []byte) (n int, err error) {
 	return
 }
 
-func TestServerSendTimeout(t *testing.T) {
-	s, c := makeTestServer()
+func serverTimeoutSendTest(s *Server, c *Client, t *testing.T) {
 	s.SetTimeout(time.Second)
 	s.SetRetries(2)
 	var serverErr error
@@ -508,10 +571,15 @@ func TestServerSendTimeout(t *testing.T) {
 	if !netErr.Timeout() {
 		t.Fatalf("timout is expected: %v", serverErr)
 	}
+
 }
 
-func TestServerReceiveTimeout(t *testing.T) {
-	s, c := makeTestServer()
+func TestServerSendTimeout(t *testing.T) {
+	s, c := makeTestServer(false)
+	serverTimeoutSendTest(s, c, t)
+}
+
+func serverReceiveTimeoutTest(s *Server, c *Client, t *testing.T) {
 	s.SetTimeout(time.Second)
 	s.SetRetries(2)
 	var serverErr error
@@ -542,8 +610,13 @@ func TestServerReceiveTimeout(t *testing.T) {
 	}
 }
 
+func TestServerReceiveTimeout(t *testing.T) {
+	s, c := makeTestServer(false)
+	serverReceiveTimeoutTest(s, c, t)
+}
+
 func TestClientReceiveTimeout(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	c.SetTimeout(time.Second)
 	c.SetRetries(2)
 	s.readHandler = func(filename string, rf io.ReaderFrom) error {
@@ -574,7 +647,7 @@ func TestClientReceiveTimeout(t *testing.T) {
 }
 
 func TestClientSendTimeout(t *testing.T) {
-	s, c := makeTestServer()
+	s, c := makeTestServer(false)
 	c.SetTimeout(time.Second)
 	c.SetRetries(2)
 	s.writeHandler = func(filename string, wt io.WriterTo) error {
@@ -785,16 +858,16 @@ func TestReadWriteErrors(t *testing.T) {
 	s := NewServer(
 		func(_ string, rf io.ReaderFrom) error {
 			_, err := rf.ReadFrom(&failingReader{}) // Read operation fails immediately.
-			if err != readError {
-				t.Errorf("want: %v, got: %v", readError, err)
+			if err != errRead {
+				t.Errorf("want: %v, got: %v", errRead, err)
 			}
 			// return no error from handler, client still should receive error
 			return nil
 		},
 		func(_ string, wt io.WriterTo) error {
 			_, err := wt.WriteTo(&failingWriter{}) // Write operation fails immediately.
-			if err != writeError {
-				t.Errorf("want: %v, got: %v", writeError, err)
+			if err != errWrite {
+				t.Errorf("want: %v, got: %v", errWrite, err)
 			}
 			// return no error from handler, client still should receive error
 			return nil
@@ -845,16 +918,16 @@ func TestReadWriteErrors(t *testing.T) {
 
 type failingReader struct{}
 
-var readError = errors.New("read error")
+var errRead = errors.New("read error")
 
-func (_ *failingReader) Read(_ []byte) (int, error) {
-	return 0, readError
+func (r *failingReader) Read(_ []byte) (int, error) {
+	return 0, errRead
 }
 
 type failingWriter struct{}
 
-var writeError = errors.New("write error")
+var errWrite = errors.New("write error")
 
-func (_ *failingWriter) Write(_ []byte) (int, error) {
-	return 0, writeError
+func (r *failingWriter) Write(_ []byte) (int, error) {
+	return 0, errWrite
 }
